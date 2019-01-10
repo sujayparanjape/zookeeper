@@ -168,6 +168,8 @@ static struct ACL _CREATOR_ALL_ACL_ACL[] = {{0x1f, {"auth", ""}}};
 struct ACL_vector ZOO_OPEN_ACL_UNSAFE = { 1, _OPEN_ACL_UNSAFE_ACL};
 struct ACL_vector ZOO_READ_ACL_UNSAFE = { 1, _READ_ACL_UNSAFE_ACL};
 struct ACL_vector ZOO_CREATOR_ALL_ACL = { 1, _CREATOR_ALL_ACL_ACL};
+    
+const int SET_WATCH_MAX_PACKET_SIZE= 1048576;
 
 #define COMPLETION_WATCH -1
 #define COMPLETION_VOID 0
@@ -1914,33 +1916,112 @@ static int send_set_watches(zhandle_t *zh)
     struct SetWatches req;
     int rc;
 
+    int total_data_watches;
+    int total_exist_watches;
+    int total_child_watches;
+
+    int remaining_data_watches;
+    int remaining_exist_watches;
+    int remaining_child_watches;
+
+    char ** data_watches_list;
+    char ** exist_watches_list;
+    char ** child_watches_list;
+
+    int current_packet_size;
+
+    int current_batch_size;
+    int current_count;
+
+    int serialized_len;
+
+
     req.relativeZxid = zh->last_zxid;
-    req.dataWatches.data = collect_keys(zh->active_node_watchers, (int*)&req.dataWatches.count);
-    req.existWatches.data = collect_keys(zh->active_exist_watchers, (int*)&req.existWatches.count);
-    req.childWatches.data = collect_keys(zh->active_child_watchers, (int*)&req.childWatches.count);
+
+    data_watches_list = collect_keys(zh->active_node_watchers, &total_data_watches);
+    exist_watches_list = collect_keys(zh->active_exist_watchers, &total_exist_watches);
+    child_watches_list = collect_keys(zh->active_child_watchers, &total_child_watches);
+
+    remaining_data_watches = total_data_watches;
+    remaining_child_watches = total_child_watches;
+    remaining_exist_watches = total_exist_watches;
 
     // return if there are no pending watches
-    if (!req.dataWatches.count && !req.existWatches.count &&
-        !req.childWatches.count) {
-        free_key_list(req.dataWatches.data, req.dataWatches.count);
-        free_key_list(req.existWatches.data, req.existWatches.count);
-        free_key_list(req.childWatches.data, req.childWatches.count);
+    if (!total_data_watches && !total_exist_watches &&
+        !total_child_watches) {
+        free_key_list(data_watches_list  , total_data_watches );
+        free_key_list(exist_watches_list , total_exist_watches );
+        free_key_list(child_watches_list , total_child_watches );
         return ZOK;
     }
+    while(remaining_data_watches > 0 || remaining_exist_watches > 0 || remaining_child_watches > 0){
+      req.dataWatches.data = NULL;
+      req.dataWatches.count= 0;
+      req.childWatches.data = NULL;
+      req.childWatches.count= 0;
+      req.existWatches.data = NULL;
+      req.existWatches.count= 0;
+      current_batch_size = 0;
+      current_packet_size = 28;
+      oa = create_buffer_oarchive();
+      rc = serialize_RequestHeader(oa, "header", &h);
 
+      current_count = 0;
+      while(remaining_data_watches > 0 && current_packet_size < SET_WATCH_MAX_PACKET_SIZE){
+        serialized_len = 4 + strlen(data_watches_list[total_data_watches - remaining_data_watches]);
+        if(current_packet_size  + serialized_len <= SET_WATCH_MAX_PACKET_SIZE){
+          //add watch to current requests
+          current_packet_size+= serialized_len;
+          ++current_count;
+          ++current_batch_size;
+          --remaining_data_watches;
+        } else
+          break;
+      }
+      req.dataWatches.data = &data_watches_list[total_data_watches-remaining_data_watches-current_count];
+      req.dataWatches.count = current_count;
 
-    oa = create_buffer_oarchive();
-    rc = serialize_RequestHeader(oa, "header", &h);
-    rc = rc < 0 ? rc : serialize_SetWatches(oa, "req", &req);
-    /* add this buffer to the head of the send queue */
-    rc = rc < 0 ? rc : queue_front_buffer_bytes(&zh->to_send, get_buffer(oa),
-            get_buffer_len(oa));
-    /* We queued the buffer, so don't free it */
-    close_buffer_oarchive(&oa, 0);
-    free_key_list(req.dataWatches.data, req.dataWatches.count);
-    free_key_list(req.existWatches.data, req.existWatches.count);
-    free_key_list(req.childWatches.data, req.childWatches.count);
-    LOG_DEBUG(LOGCALLBACK(zh), "Sending set watches request to %s",zoo_get_current_server(zh));
+      current_count = 0;
+      while(remaining_child_watches > 0 && current_packet_size < SET_WATCH_MAX_PACKET_SIZE){
+        serialized_len = 4 + strlen(child_watches_list[total_child_watches - remaining_child_watches]);
+        if(current_packet_size + serialized_len <= SET_WATCH_MAX_PACKET_SIZE){
+          //add watch to current requests
+          current_packet_size+= serialized_len;
+          ++current_count;
+          ++current_batch_size;
+          --remaining_child_watches;
+        } else
+          break;
+      }
+      req.childWatches.data = &child_watches_list[total_child_watches-remaining_child_watches-current_count];
+      req.childWatches.count = current_count;
+
+      current_count = 0;
+      while(remaining_exist_watches > 0 && current_packet_size < SET_WATCH_MAX_PACKET_SIZE){
+        serialized_len = 4 + strlen(exist_watches_list[total_exist_watches - remaining_exist_watches]);
+        if(current_packet_size  + serialized_len <= SET_WATCH_MAX_PACKET_SIZE){
+          //add watch to current requests
+          current_packet_size+= serialized_len;
+          ++current_count;
+          ++current_batch_size;
+          --remaining_exist_watches;
+        } else
+          break;
+      }
+      req.existWatches.data = &exist_watches_list[total_exist_watches-remaining_exist_watches-current_count];
+      req.existWatches.count = current_count;
+      LOG_DEBUG(LOGCALLBACK(zh), "Sending batch of %d watches to %s, packet size %d",current_batch_size,zoo_get_current_server(zh),current_packet_size);
+      //serialize the request and put it in front of the queue
+      rc = rc < 0 ? rc : serialize_SetWatches(oa, "req", &req);
+      /* add this buffer to the head of the send queue */
+      rc = rc < 0 ? rc : queue_front_buffer_bytes(&zh->to_send, get_buffer(oa),
+          get_buffer_len(oa));
+      /* We queued the buffer, so don't free it */
+      close_buffer_oarchive(&oa, 0);
+    }
+    free_key_list(data_watches_list, total_data_watches);
+    free_key_list(exist_watches_list, total_exist_watches);
+    free_key_list(child_watches_list, total_child_watches);
     return (rc < 0)?ZMARSHALLINGERROR:ZOK;
 }
 
